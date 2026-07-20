@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 # ======================================================
-# ⚡ VPS 跨境网络全天候测绘探针 (VPS-Monitor-Pro) v1.0
+# ⚡ VPS 跨境网络全天候测绘探针 (VPS-Monitor-Pro) v1.0.2
 # ======================================================
 
 LOG_DIR="/root/vps_monitor_data"
 SPEED_CSV="${LOG_DIR}/speed_log.csv"
 TCPING_CSV="${LOG_DIR}/tcping_log.csv"
-
-# 云端配置与本地自定义配置
 CONFIG_FILE="${LOG_DIR}/nodes.conf"
 REGION_CONF="${LOG_DIR}/region.conf"
+FREQ_CONF="${LOG_DIR}/freq.conf"
+END_TIME_CONF="${LOG_DIR}/end_time.conf"
 CUSTOM_TCP="${LOG_DIR}/custom_tcp.list"
 CUSTOM_SPEED="${LOG_DIR}/custom_speed.list"
 REMOTE_CONFIG_URL="https://raw.githubusercontent.com/playfulsoul/vps-monitor-pro/main/nodes.conf"
 
-# ================= 基础环境与初始化 =================
 init_env() {
     mkdir -p "$LOG_DIR"
-    
     if ! command -v jq &> /dev/null || ! command -v curl &> /dev/null; then
         echo "🔧 正在安装必要依赖 (jq, curl, cron)..."
         if command -v apt-get &> /dev/null; then
@@ -26,61 +24,57 @@ init_env() {
             yum install -y jq curl iputils cronie
         fi
     fi
-
     if ! command -v tcping &> /dev/null && [ ! -f "${LOG_DIR}/tcping" ]; then
         echo "🔧 正在初始化轻量级 TCPing 引擎..."
         curl -sL "https://github.com/cloverstd/tcping/releases/download/v0.1.1/tcping-linux-amd64" -o "${LOG_DIR}/tcping"
         chmod +x "${LOG_DIR}/tcping"
     fi
-
     if ! command -v speedtest &> /dev/null; then
         echo "🔧 正在安装 Ookla 官方 Speedtest CLI 工具..."
         curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash &> /dev/null
         apt-get install -y speedtest &> /dev/null || yum install -y speedtest &> /dev/null
     fi
-
     if [ ! -f "$SPEED_CSV" ]; then
         echo "测试时间,测试节点类型,目标节点ID/名称,下载速度(Mbps),上传速度(Mbps),延迟(ms),CPU负载" > "$SPEED_CSV"
     fi
     if [ ! -f "$TCPING_CSV" ]; then
         echo "测试时间,目标名称,目标IP,端口,平均延迟(ms),丢包率(%)" > "$TCPING_CSV"
     fi
-
     curl -sL --connect-timeout 5 "$REMOTE_CONFIG_URL" -o "${CONFIG_FILE}.tmp"
-    if [ -s "${CONFIG_FILE}.tmp" ]; then
-        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    fi
+    if [ -s "${CONFIG_FILE}.tmp" ]; then mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"; fi
 }
 
 get_cpu_load() {
     uptime | awk -F'load average:' '{ print $2 }' | cut -d, -f1 | tr -d ' '
 }
 
-# ================= 测试引擎模块 =================
 run_tcping_test() {
     local now=$(date "+%Y-%m-%d %H:%M:%S")
     local tcping_bin=$(command -v tcping || echo "${LOG_DIR}/tcping")
 
-    # 1. 跑云端标杆 IP
     if [ -f "$CONFIG_FILE" ]; then
         jq -c '.tcping_targets[]' "$CONFIG_FILE" 2>/dev/null | while read -r item; do
             local name=$(echo "$item" | jq -r '.name')
             local ip=$(echo "$item" | jq -r '.ip')
             local port=$(echo "$item" | jq -r '.port')
 
-            local res=$("$tcping_bin" -c 20 -i 0.1 -g "$port" "$ip" 2>/dev/null)
-            local loss=$(echo "$res" | grep -o '[0-9]*%' | tr -d '%' || echo "100")
-            local avg_ping=$(echo "$res" | grep -o 'avg: [0-9.]*' | awk '{print $2}' || echo "0")
+            local res=$("$tcping_bin" -c 20 -i 0.1 "$ip" "$port" 2>/dev/null)
+            local loss=$(echo "$res" | grep 'packet loss' | awk -F'%' '{print $1}' | awk '{print $NF}')
+            local avg_ping=$(echo "$res" | grep 'min/avg/max' | awk -F'=' '{print $2}' | awk -F'/' '{print $2}' | tr -d ' ')
+            
+            [ -z "$loss" ] && loss="100"
+            [ -z "$avg_ping" ] && avg_ping="0"
             echo "\"$now\",\"$name\",\"$ip\",$port,$avg_ping,$loss" >> "$TCPING_CSV"
         done
     fi
 
-    # 2. 跑本地自定义 IP
     if [ -f "$CUSTOM_TCP" ]; then
         while IFS=',' read -r c_name c_ip c_port; do
-            local res=$("$tcping_bin" -c 20 -i 0.1 -g "$c_port" "$c_ip" 2>/dev/null)
-            local loss=$(echo "$res" | grep -o '[0-9]*%' | tr -d '%' || echo "100")
-            local avg_ping=$(echo "$res" | grep -o 'avg: [0-9.]*' | awk '{print $2}' || echo "0")
+            local res=$("$tcping_bin" -c 20 -i 0.1 "$c_ip" "$c_port" 2>/dev/null)
+            local loss=$(echo "$res" | grep 'packet loss' | awk -F'%' '{print $1}' | awk '{print $NF}')
+            local avg_ping=$(echo "$res" | grep 'min/avg/max' | awk -F'=' '{print $2}' | awk -F'/' '{print $2}' | tr -d ' ')
+            [ -z "$loss" ] && loss="100"
+            [ -z "$avg_ping" ] && avg_ping="0"
             echo "\"$now\",\"[自定] $c_name\",\"$c_ip\",$c_port,$avg_ping,$loss" >> "$TCPING_CSV"
         done < "$CUSTOM_TCP"
     fi
@@ -111,14 +105,12 @@ run_speed_test() {
     local cpu_load=$(get_cpu_load)
     local region=$(cat "$REGION_CONF" 2>/dev/null || echo "beijing")
 
-    # 1. 测 VPS 本地物理极速
     local local_res=$(test_single_speed "auto")
     if [ -n "$local_res" ]; then
         IFS=',' read -r d u p name <<< "$local_res"
         echo "\"$now\",\"VPS本地极速\",\"$name\",$d,$u,$p,$cpu_load" >> "$SPEED_CSV"
     fi
 
-    # 2. 测 1+3 框架三网
     for isp in telecom unicom mobile; do
         local node_pool=$(jq -r ".speedtest_nodes.${region}.${isp}[]" "$CONFIG_FILE" 2>/dev/null)
         local success=0
@@ -136,7 +128,6 @@ run_speed_test() {
         fi
     done
 
-    # 3. 测本地自定义 Speedtest 节点
     if [ -f "$CUSTOM_SPEED" ]; then
         while IFS=',' read -r c_name c_id; do
             local c_res=$(test_single_speed "$c_id")
@@ -150,44 +141,109 @@ run_speed_test() {
     fi
 }
 
+# Cron 调度核心：加入到期自毁逻辑
 run_cron_task() {
     init_env
+    # 检查是否设定了到期时间
+    if [ -f "$END_TIME_CONF" ]; then
+        local end_ts=$(cat "$END_TIME_CONF")
+        if [ "$end_ts" -gt 0 ]; then
+            local now_ts=$(date +%s)
+            if [ "$now_ts" -ge "$end_ts" ]; then
+                # 触发自毁：停止Cron并自动打包数据
+                stop_cron > /dev/null
+                tar -czf /root/vps_monitor_AutoExport_$(date +"%Y%m%d").tar.gz -C "$LOG_DIR" speed_log.csv tcping_log.csv 2>/dev/null
+                rm -f "$END_TIME_CONF"
+                exit 0
+            fi
+        fi
+    fi
+    
     run_tcping_test
     run_speed_test
 }
 
-# ================= 任务调度与菜单管理模块 =================
 setup_cron() {
+    local freq=$(cat "$FREQ_CONF" 2>/dev/null || echo "1")
     crontab -l 2>/dev/null | grep -v "vps-monitor-pro.sh" > /tmp/cron_bak
-    echo "0 1-17/2 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
-    echo "0 18-23 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
-    echo "0 0 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
+    
+    if [ "$freq" == "2" ]; then
+        # 极限模式: 每小时
+        echo "0 * * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
+    elif [ "$freq" == "3" ]; then
+        # 佛系模式: 每4小时
+        echo "0 */4 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
+    else
+        # 默认智能模式: 白天2H，晚上1H
+        echo "0 1-17/2 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
+        echo "0 18-23 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
+        echo "0 0 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
+    fi
     crontab /tmp/cron_bak
     rm -f /tmp/cron_bak
-    echo "✅ 自动化 Cron 定时任务配置完成！(白天2H/次, 晚高峰1H/次)"
 }
 
 stop_cron() {
     crontab -l 2>/dev/null | grep -v "vps-monitor-pro.sh" | crontab -
-    echo "🛑 已成功停止并注销所有自动化监控任务。"
+    echo "🛑 已成功停止并注销后台监控任务。"
 }
 
-change_region() {
+# ================= 核心向导式配置流程 =================
+wizard_setup() {
     clear
     echo "======================================================"
-    echo "🎯 请选择 '1+3' 测速核心大区:"
+    echo "🚀 VPS-Monitor-Pro | 自动化监控部署向导"
+    echo "======================================================"
+    
+    # Step 1: 测速大区
+    echo "[1/3] 请选择 '1+3' 核心测速大区:"
     echo "  1. 华北/北京枢纽"
     echo "  2. 华东/上海枢纽"
     echo "  3. 华南/广州枢纽"
-    echo "======================================================"
-    read -p "请输入对应的操作数字 [1-3]: " rc
-    case "$rc" in
-        1) echo "beijing" > "$REGION_CONF"; echo "✅ 已切换至: 华北/北京枢纽" ;;
-        2) echo "shanghai" > "$REGION_CONF"; echo "✅ 已切换至: 华东/上海枢纽" ;;
-        3) echo "guangzhou" > "$REGION_CONF"; echo "✅ 已切换至: 华南/广州枢纽" ;;
-        *) echo "❌ 输入无效，保持原有设置。" ;;
+    read -p "请输入对应的操作数字 [1-3] (默认1): " rc
+    case "${rc:-1}" in
+        2) echo "shanghai" > "$REGION_CONF"; echo "✅ 已设定: 华东/上海枢纽" ;;
+        3) echo "guangzhou" > "$REGION_CONF"; echo "✅ 已设定: 华南/广州枢纽" ;;
+        *) echo "beijing" > "$REGION_CONF"; echo "✅ 已设定: 华北/北京枢纽" ;;
     esac
-    sleep 1.5
+    echo "------------------------------------------------------"
+
+    # Step 2: 监控频率
+    echo "[2/3] 请选择自动化监控频率:"
+    echo "  1. 🌟 智能黄金频率 (白天2H/次, 晚高峰1H/次) [推荐]"
+    echo "  2. 🔥 极限高频模式 (全天 24 小时，每 1 小时/次)"
+    echo "  3. ☕ 佛系低频模式 (全天 24 小时，每 4 小时/次)"
+    read -p "请输入对应的操作数字 [1-3] (默认1): " fc
+    case "${fc:-1}" in
+        2|3) echo "$fc" > "$FREQ_CONF" ;;
+        *) echo "1" > "$FREQ_CONF" ;;
+    esac
+    echo "✅ 频率已设定。"
+    echo "------------------------------------------------------"
+
+    # Step 3: 运行周期
+    echo "[3/3] 请设置监控持续周期:"
+    echo "  👉 输入具体的数字 (如 3)，代表连续监控 3 天后自动停止并打包数据。"
+    echo "  👉 输入 0，代表【持续监测】，直到你手动关闭它。"
+    read -p "请输入天数 (默认0): " days
+    days=${days:-0}
+    if [[ ! "$days" =~ ^[0-9]+$ ]]; then days=0; fi
+    
+    if [ "$days" -eq 0 ]; then
+        echo "0" > "$END_TIME_CONF"
+        echo "✅ 已设定为: 持续监测 (需手动停止)"
+    else
+        # 计算未来时间戳
+        local end_ts=$(($(date +%s) + days * 86400))
+        echo "$end_ts" > "$END_TIME_CONF"
+        echo "✅ 已设定为: 连续监控 $days 天后自动停止并打包"
+    fi
+    echo "======================================================"
+    echo "⚙️ 正在向系统调度器写入任务..."
+    init_env
+    setup_cron
+    echo "🎉 部署全部完成！任务将在后台默默运行。"
+    read -p "按回车键返回主菜单..."
 }
 
 manage_custom_targets() {
@@ -215,32 +271,19 @@ manage_custom_targets() {
             c_port=${c_port:-80}
             if [ -n "$c_name" ] && [ -n "$c_ip" ]; then
                 echo "$c_name,$c_ip,$c_port" >> "$CUSTOM_TCP"
-                echo "✅ 已成功追加 TCPing 目标: $c_name ($c_ip:$c_port)"
-            else
-                echo "❌ 输入为空，已取消。"
+                echo "✅ 已成功追加 TCPing 目标: $c_name"
             fi
-            sleep 1.5
-            manage_custom_targets
-            ;;
+            sleep 1; manage_custom_targets ;;
         2)
             echo ""
             read -p "👉 请输入节点名称 (例: 洛杉矶): " s_name
             read -p "👉 请输入 Speedtest Server ID: " s_id
             if [ -n "$s_name" ] && [ -n "$s_id" ]; then
                 echo "$s_name,$s_id" >> "$CUSTOM_SPEED"
-                echo "✅ 已成功追加测速节点: $s_name (ID: $s_id)"
-            else
-                echo "❌ 输入为空，已取消。"
+                echo "✅ 已成功追加测速节点: $s_name"
             fi
-            sleep 1.5
-            manage_custom_targets
-            ;;
-        3)
-            rm -f "$CUSTOM_TCP" "$CUSTOM_SPEED"
-            echo "🧹 所有自定义目标已清空！"
-            sleep 1.5
-            manage_custom_targets
-            ;;
+            sleep 1; manage_custom_targets ;;
+        3) rm -f "$CUSTOM_TCP" "$CUSTOM_SPEED"; echo "🧹 已清空！"; sleep 1; manage_custom_targets ;;
         0) return ;;
         *) manage_custom_targets ;;
     esac
@@ -249,82 +292,60 @@ manage_custom_targets() {
 show_menu() {
     clear
     local cron_status="未运行"
-    if crontab -l 2>/dev/null | grep -q "vps-monitor-pro.sh"; then
-        cron_status="运行中"
-    fi
+    if crontab -l 2>/dev/null | grep -q "vps-monitor-pro.sh"; then cron_status="运行中"; fi
     
-    local tz=$(date +"%Z %z")
     local current_region=$(cat "$REGION_CONF" 2>/dev/null || echo "beijing")
-    local region_name="华北/北京枢纽"
-    if [ "$current_region" == "shanghai" ]; then region_name="华东/上海枢纽"; fi
-    if [ "$current_region" == "guangzhou" ]; then region_name="华南/广州枢纽"; fi
+    local region_name="华北/北京"
+    if [ "$current_region" == "shanghai" ]; then region_name="华东/上海"; fi
+    if [ "$current_region" == "guangzhou" ]; then region_name="华南/广州"; fi
 
-    local c_total=$(($(wc -l < "$CUSTOM_TCP" 2>/dev/null || echo 0) + $(wc -l < "$CUSTOM_SPEED" 2>/dev/null || echo 0)))
-    local custom_badge=""
-    if [ "$c_total" -gt 0 ]; then custom_badge=" (已挂载 $c_total 个)"; fi
+    local freq_str="未部署"
+    local f_val=$(cat "$FREQ_CONF" 2>/dev/null || echo "1")
+    if [ "$f_val" == "2" ]; then freq_str="极限高频"; elif [ "$f_val" == "3" ]; then freq_str="佛系低频"; else freq_str="智能推荐"; fi
+
+    local dur_str="未部署"
+    local e_val=$(cat "$END_TIME_CONF" 2>/dev/null || echo "-1")
+    if [ "$e_val" == "0" ]; then 
+        dur_str="持续监测 (需手动停止)"
+    elif [ "$e_val" -gt 0 ]; then
+        dur_str="至 $(date -d @"$e_val" "+%Y-%m-%d %H:%M" 2>/dev/null || date -r "$e_val" "+%Y-%m-%d %H:%M" 2>/dev/null) 自动停止"
+    fi
 
     echo "======================================================"
-    echo "⚡ VPS 跨境网络全天候测绘探针 (VPS-Monitor-Pro) v1.0"
+    echo "⚡ VPS 跨境网络全天候测绘探针 (VPS-Monitor-Pro) v1.0.2"
     echo "======================================================"
-    echo "  [▶️ 监控状态: $cron_status] | [🕒 系统时区: $tz]"
+    echo "  [▶️ 状态: $cron_status] | [⏱️ 频率: $freq_str] | [🎯 区域: $region_name]"
+    echo "  [⏳ 周期: $dur_str]"
     echo "======================================================"
-    echo "  [ 核心控制 ]"
-    echo "  1. 🚀 部署并启动全自动监控 (白天2H/次, 晚高峰1H/次)"
-    echo "  2. 🛑 停止所有监控任务"
-    echo ""
-    echo "  [ 参数定制 ]"
-    echo "  3. 🎯 测速城市设定 (当前: 1+3 模式 - $region_name)"
-    echo "  4. 🛠️ 管理自定义监控目标$custom_badge"
-    echo "  5. ⚙️ 修改监控执行频率 (敬请期待)"
-    echo ""
-    echo "  [ 数据输出 ]"
-    echo "  6. 📊 立刻执行一次手动综合探测"
-    echo "  7. 📉 查看最近报告 (测速 与 TCPing)"
-    echo "  8. 📥 导出原始 CSV 数据 (打包至当前目录)"
-    echo ""
-    echo "  [ 系统维护 ]"
-    echo "  9. 🧹 清理过期日志与缓存"
+    echo "  1. 🚀 向导式部署与启动监控任务"
+    echo "  2. 🛑 手动停止所有后台监控"
+    echo "  3. 🛠️ 管理自定义目标 (追加 IP / 节点)"
+    echo "------------------------------------------------------"
+    echo "  4. 📊 立即手动触发一次完整探测"
+    echo "  5. 📉 查看最新测试报告 (在终端预览)"
+    echo "  6. 📥 导出原始数据包 (打包至 /root 目录)"
+    echo "------------------------------------------------------"
+    echo "  9. 🧹 清理测试缓存与历史数据"
     echo "  0. 退出脚本"
     echo "======================================================"
     read -p "请输入对应的操作数字 [0-9]: " choice
     
     case "$choice" in
-        1) init_env; setup_cron; read -p "按回车键继续..." ;;
-        2) stop_cron; read -p "按回车键继续..." ;;
-        3) change_region ;;
-        4) manage_custom_targets ;;
-        5) echo "⏳ 高级自定义频率模块开发中..."; read -p "按回车键继续..." ;;
-        6) 
-            echo "⌛ 正在执行综合测试，请耐心等待 (约需2-3分钟)..."
-            run_cron_task
-            echo "✅ 测试完成！数据已写入日志。"
-            read -p "按回车键继续..."
-            ;;
-        7) 
+        1) wizard_setup ;;
+        2) stop_cron; rm -f "$END_TIME_CONF" "$FREQ_CONF"; read -p "按回车键继续..." ;;
+        3) manage_custom_targets ;;
+        4) echo "⌛ 正在执行综合探测 (约需2-3分钟)..."; run_cron_task; echo "✅ 完成！"; read -p "按回车键继续..." ;;
+        5) 
             echo "=== 最近 6 条带宽测速记录 ==="
             tail -n 7 "$SPEED_CSV" 2>/dev/null | column -s, -t || echo "暂无记录"
             echo -e "\n=== 最近 9 条 TCPing 记录 ==="
             tail -n 10 "$TCPING_CSV" 2>/dev/null | column -s, -t || echo "暂无记录"
-            read -p "按回车键继续..."
-            ;;
-        8) 
-            tar -czf /root/vps_monitor_export_$(date +"%Y%m%d").tar.gz -C "$LOG_DIR" speed_log.csv tcping_log.csv 2>/dev/null
-            echo "✅ 导出成功！文件已保存为 /root/vps_monitor_export_*.tar.gz"
-            read -p "按回车键继续..."
-            ;;
-        9) 
-            rm -f "$SPEED_CSV" "$TCPING_CSV"
-            echo "🧹 历史测速数据已清空。"
-            read -p "按回车键继续..."
-            ;;
+            read -p "按回车键继续..." ;;
+        6) tar -czf /root/vps_monitor_export_$(date +"%Y%m%d").tar.gz -C "$LOG_DIR" speed_log.csv tcping_log.csv 2>/dev/null; echo "✅ 导出成功！"; read -p "按回车键继续..." ;;
+        9) rm -f "$SPEED_CSV" "$TCPING_CSV"; echo "🧹 历史数据已清空。"; read -p "按回车键继续..." ;;
         0) exit 0 ;;
-        *) echo "输入无效，请重新选择！"; sleep 1 ;;
+        *) echo "输入无效！"; sleep 1 ;;
     esac
 }
 
-if [ "$1" == "--cron" ]; then
-    run_cron_task
-else
-    init_env
-    while true; do show_menu; done
-fi
+if [ "$1" == "--cron" ]; then run_cron_task; else init_env; while true; do show_menu; done; fi
