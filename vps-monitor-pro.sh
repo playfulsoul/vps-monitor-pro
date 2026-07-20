@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================
-# ⚡ VPS 跨境网络全天候测绘探针 (VPS-Monitor-Pro) v1.0.2
+# ⚡ VPS 跨境网络全天候测绘探针 (VPS-Monitor-Pro) v1.0.3
 # ======================================================
 
 LOG_DIR="/root/vps_monitor_data"
@@ -16,21 +16,27 @@ REMOTE_CONFIG_URL="https://raw.githubusercontent.com/playfulsoul/vps-monitor-pro
 
 init_env() {
     mkdir -p "$LOG_DIR"
+    
+    # ⚠️ 核心修复：强制对齐北京时间 (Asia/Shanghai)
+    if command -v timedatectl &> /dev/null; then
+        timedatectl set-timezone Asia/Shanghai 2>/dev/null
+    else
+        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime 2>/dev/null
+    fi
+
     if ! command -v jq &> /dev/null || ! command -v curl &> /dev/null; then
         echo "🔧 正在安装必要依赖 (jq, curl, cron)..."
         if command -v apt-get &> /dev/null; then
-            apt-get update -y && apt-get install -y jq curl ping cron
+            apt-get update -y && apt-get install -y jq curl ping cron tzdata
         elif command -v yum &> /dev/null; then
-            yum install -y jq curl iputils cronie
+            yum install -y jq curl iputils cronie tzdata
         fi
     fi
     if ! command -v tcping &> /dev/null && [ ! -f "${LOG_DIR}/tcping" ]; then
-        echo "🔧 正在初始化轻量级 TCPing 引擎..."
         curl -sL "https://github.com/cloverstd/tcping/releases/download/v0.1.1/tcping-linux-amd64" -o "${LOG_DIR}/tcping"
         chmod +x "${LOG_DIR}/tcping"
     fi
     if ! command -v speedtest &> /dev/null; then
-        echo "🔧 正在安装 Ookla 官方 Speedtest CLI 工具..."
         curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash &> /dev/null
         apt-get install -y speedtest &> /dev/null || yum install -y speedtest &> /dev/null
     fi
@@ -141,16 +147,13 @@ run_speed_test() {
     fi
 }
 
-# Cron 调度核心：加入到期自毁逻辑
 run_cron_task() {
     init_env
-    # 检查是否设定了到期时间
     if [ -f "$END_TIME_CONF" ]; then
         local end_ts=$(cat "$END_TIME_CONF")
         if [ "$end_ts" -gt 0 ]; then
             local now_ts=$(date +%s)
             if [ "$now_ts" -ge "$end_ts" ]; then
-                # 触发自毁：停止Cron并自动打包数据
                 stop_cron > /dev/null
                 tar -czf /root/vps_monitor_AutoExport_$(date +"%Y%m%d").tar.gz -C "$LOG_DIR" speed_log.csv tcping_log.csv 2>/dev/null
                 rm -f "$END_TIME_CONF"
@@ -158,7 +161,6 @@ run_cron_task() {
             fi
         fi
     fi
-    
     run_tcping_test
     run_speed_test
 }
@@ -168,13 +170,10 @@ setup_cron() {
     crontab -l 2>/dev/null | grep -v "vps-monitor-pro.sh" > /tmp/cron_bak
     
     if [ "$freq" == "2" ]; then
-        # 极限模式: 每小时
         echo "0 * * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
     elif [ "$freq" == "3" ]; then
-        # 佛系模式: 每4小时
         echo "0 */4 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
     else
-        # 默认智能模式: 白天2H，晚上1H
         echo "0 1-17/2 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
         echo "0 18-23 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
         echo "0 0 * * * /bin/bash $(readlink -f "$0") --cron >/dev/null 2>&1" >> /tmp/cron_bak
@@ -188,14 +187,12 @@ stop_cron() {
     echo "🛑 已成功停止并注销后台监控任务。"
 }
 
-# ================= 核心向导式配置流程 =================
 wizard_setup() {
     clear
     echo "======================================================"
     echo "🚀 VPS-Monitor-Pro | 自动化监控部署向导"
     echo "======================================================"
     
-    # Step 1: 测速大区
     echo "[1/3] 请选择 '1+3' 核心测速大区:"
     echo "  1. 华北/北京枢纽"
     echo "  2. 华东/上海枢纽"
@@ -208,9 +205,8 @@ wizard_setup() {
     esac
     echo "------------------------------------------------------"
 
-    # Step 2: 监控频率
-    echo "[2/3] 请选择自动化监控频率:"
-    echo "  1. 🌟 智能黄金频率 (白天2H/次, 晚高峰1H/次) [推荐]"
+    echo "[2/3] 请选择自动化监控频率 (已自动对齐北京时间):"
+    echo "  1. 🌟 智能黄金频率 (白天2H/次, 晚高峰18-23点1H/次)"
     echo "  2. 🔥 极限高频模式 (全天 24 小时，每 1 小时/次)"
     echo "  3. ☕ 佛系低频模式 (全天 24 小时，每 4 小时/次)"
     read -p "请输入对应的操作数字 [1-3] (默认1): " fc
@@ -221,7 +217,6 @@ wizard_setup() {
     echo "✅ 频率已设定。"
     echo "------------------------------------------------------"
 
-    # Step 3: 运行周期
     echo "[3/3] 请设置监控持续周期:"
     echo "  👉 输入具体的数字 (如 3)，代表连续监控 3 天后自动停止并打包数据。"
     echo "  👉 输入 0，代表【持续监测】，直到你手动关闭它。"
@@ -233,7 +228,6 @@ wizard_setup() {
         echo "0" > "$END_TIME_CONF"
         echo "✅ 已设定为: 持续监测 (需手动停止)"
     else
-        # 计算未来时间戳
         local end_ts=$(($(date +%s) + days * 86400))
         echo "$end_ts" > "$END_TIME_CONF"
         echo "✅ 已设定为: 连续监控 $days 天后自动停止并打包"
@@ -308,14 +302,18 @@ show_menu() {
     if [ "$e_val" == "0" ]; then 
         dur_str="持续监测 (需手动停止)"
     elif [ "$e_val" -gt 0 ]; then
-        dur_str="至 $(date -d @"$e_val" "+%Y-%m-%d %H:%M" 2>/dev/null || date -r "$e_val" "+%Y-%m-%d %H:%M" 2>/dev/null) 自动停止"
+        dur_str="至 $(date -d @"$e_val" "+%Y-%m-%d %H:%M" 2>/dev/null || date -r "$e_val" "+%Y-%m-%d %H:%M" 2>/dev/null) (北京时间) 自动停止"
     fi
 
+    # 动态抓取当前系统时区确认
+    local tz=$(date +"%Z %z")
+
     echo "======================================================"
-    echo "⚡ VPS 跨境网络全天候测绘探针 (VPS-Monitor-Pro) v1.0.2"
+    echo "⚡ VPS 跨境网络全天候测绘探针 (VPS-Monitor-Pro) v1.0.3"
     echo "======================================================"
     echo "  [▶️ 状态: $cron_status] | [⏱️ 频率: $freq_str] | [🎯 区域: $region_name]"
     echo "  [⏳ 周期: $dur_str]"
+    echo "  [🕒 系统当前时区已被强制校准为: $tz]"
     echo "======================================================"
     echo "  1. 🚀 向导式部署与启动监控任务"
     echo "  2. 🛑 手动停止所有后台监控"
@@ -348,4 +346,10 @@ show_menu() {
     esac
 }
 
-if [ "$1" == "--cron" ]; then run_cron_task; else init_env; while true; do show_menu; done; fi
+# 若首次直接运行菜单，确保时区已经被校准一次
+if [ "$1" == "--cron" ]; then 
+    run_cron_task
+else 
+    init_env > /dev/null 2>&1
+    while true; do show_menu; done
+fi
