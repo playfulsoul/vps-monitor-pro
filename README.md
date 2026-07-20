@@ -30,4 +30,4 @@
 无需繁琐的依赖配置，只需通过 SSH 登录你的 VPS（支持 Ubuntu / Debian / CentOS 等主流系统），直接粘贴并执行以下命令：
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/playfulsoul/vps-monitor-pro/main/vps-monitor-pro.sh
+bash <(curl -sL https://raw.githubusercontent.com/playfulsoul/vps-monitor-pro/main/vps-monitor-pro.sh)
